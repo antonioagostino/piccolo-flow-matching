@@ -1,0 +1,7 @@
+name: piccolo-flow-matching
+channels:
+  - defaults
+dependencies:
+  - pip
+  - pip:
+      - -r requirements.txt

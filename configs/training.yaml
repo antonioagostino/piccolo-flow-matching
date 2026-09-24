@@ -1,0 +1,28 @@
+training:
+  data_dir: ./data/
+  backbone: dit
+  embedding_dim: 128
+  sigma_min: 0.0
+  ema_decay: 0.999
+  backbone_config: ./configs/dit.yaml
+  batch_size: 8
+  learning_rate: 0.003
+  min_learning_rate: 0.00000001
+  lr_warmup_iterations: 25
+  max_iterations: null
+  weight_decay: 0
+  max_grad_norm: 1.0
+  device: auto
+  compile_model: true
+  gradient_accumulation_steps: 1
+  seed: 42
+  log_every_iterations: 50
+  val_every_iterations: 50
+  val_max_iterations: 50
+  n_epochs: 5
+  checkpoint_dir: ./checkpoints
+  wandb:
+    enabled: false
+    project: piccolo-flow-matching
+    run_name: piccolo-flow-matching-run-1
+    mode: offline
