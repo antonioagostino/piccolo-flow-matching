@@ -5,18 +5,27 @@ from src.utils.sampling import integrate
 
 from src.flow import FlowMatchingModel
 
+def count_params(module):
+    total = sum(p.numel() for p in module.parameters())
+    trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return total, trainable
+
 if __name__ == "__main__":
     device = torch.device("mps")
-    EMBEDDING_DIM = 128
+    EMBEDDING_DIM = 384
     SIGMA_MIN = 0.05
     BATCH_SIZE = 1
     flow_matching_model = FlowMatchingModel(
-            backbone="unet",
-            backbone_config_file=Path("./configs/unet.yaml"),
+            backbone="dit",
+            backbone_config_file=Path("./configs/dit.yaml"),
             embedding_dim=EMBEDDING_DIM,
-            num_classes=5, # only for testing purposes
+            num_classes=10, # only for testing purposes
             device=device
     )
+
+    print("Total number of trainable params:", count_params(flow_matching_model))
+    for name, child in flow_matching_model.named_children():
+        print(name, count_params(child))
 
     x_batch = []
     y_batch = []

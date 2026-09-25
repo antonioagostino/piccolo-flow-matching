@@ -1,5 +1,5 @@
 model:
-  down_convs_channels: [3, 64, 64, 128, 128, 256, 256]
-  up_convs_channels: [256, 128, 128, 64, 64]
+  down_convs_channels: [3, 64, 64, 128, 128, 256, 256, 512, 512, 1024, 1024]
+  up_convs_channels: [1024, 512, 512, 256, 256, 128, 128, 64, 64]
   num_norm_groups: 32
   output_channels: 3
