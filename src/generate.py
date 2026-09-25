@@ -12,17 +12,6 @@ from src.train import load_training_config, validate_device
 DEFAULT_NFE_STEPS = [1, 2, 5, 10, 25, 50]
 DEFAULT_GUIDANCE = [0.0, 1.0, 3.0]
 
-def velocity_fn(x: torch.Tensor, t: torch.Tensor, w: float = 0.0) -> torch.Tensor:
-    if w == 0:
-        return flow_matching_model(x, t, class_tensor)
-    else:
-        x_in = torch.cat([x, x])
-        t_in = torch.cat([t, t])
-        y_in = torch.cat([class_tensor, null_class_tensor])
-        v_theta_c, v_theta_u = flow_matching_model(x_in, t_in, y_in).chunk(2)
-        # CFG
-        return (1.0 + w) * v_theta_c - w * v_theta_u
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate samples with a trained Flow-Matching model.")
     parser.add_argument(
@@ -110,15 +99,14 @@ if __name__ == "__main__":
 
     class_to_generate = args.class_id if args.class_id is not None else int(input("Choose a class: "))
     class_tensor = torch.full((args.batch_size,), class_to_generate, device=device, dtype=torch.long)
-    null_class_tensor = torch.full((args.batch_size,), len(train_set.classes), device=device, dtype=torch.long)
 
     x_0 = torch.randn((args.batch_size, *train_set[0][0].shape), device=device)
 
     if args.mode == "nfe":
         nfe_steps = args.nfe_steps if args.nfe_steps is not None else DEFAULT_NFE_STEPS
         w = args.guidance[0] if args.guidance is not None else 0.0 # Guidance strenght
-        x_1_hat_reference = integrate(velocity_fn, x_0, args.reference_nfe, w)
-        samples = [integrate(velocity_fn, x_0, steps, w) for steps in nfe_steps]
+        x_1_hat_reference = integrate(flow_matching_model, x_0, class_tensor, args.reference_nfe, w)
+        samples = [integrate(flow_matching_model, x_0, class_tensor, steps, w) for steps in nfe_steps]
 
         err = np.array([((sample - x_1_hat_reference) ** 2).mean().item() for sample in samples])
         n = np.array(nfe_steps, dtype=np.float32)
@@ -142,7 +130,7 @@ if __name__ == "__main__":
     else:
         guidance = args.guidance if args.guidance is not None else DEFAULT_GUIDANCE
         nfe_steps = args.nfe_steps[0] if args.nfe_steps is not None else 25
-        samples = [integrate(velocity_fn, x_0, nfe_steps, w) for w in guidance]
+        samples = [integrate(flow_matching_model, x_0, class_tensor, nfe_steps, w) for w in guidance]
 
     x_1_hat = torch.cat(samples)
     print(x_1_hat.mean().item(), x_1_hat.std().item(), x_1_hat.min().item(), x_1_hat.max().item())

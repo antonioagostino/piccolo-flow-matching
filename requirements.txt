@@ -9,3 +9,7 @@ wandb
 huggingface_hub
 opencv-python
 torchvision
+
+clean-fid==0.1.35
+# clean-fid 0.1.35 calls scipy.linalg.sqrtm(disp=...), removed in scipy 1.18
+scipy<1.18

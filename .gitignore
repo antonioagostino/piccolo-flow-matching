@@ -3,3 +3,12 @@ __pycache__/
 
 # Datasets
 data/
+
+# Evaluation results
+results/
+
+# Checkpoints
+checkpoints/
+
+# VSCode dirs
+.vscode/
