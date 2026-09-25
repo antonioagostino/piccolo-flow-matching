@@ -21,6 +21,7 @@ training:
   val_max_iterations: 50
   n_epochs: 5
   checkpoint_dir: ./checkpoints
+  snapshot_every_iterations: null
   wandb:
     enabled: false
     project: piccolo-flow-matching

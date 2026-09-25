@@ -3,7 +3,10 @@ from pathlib import Path
 from datetime import datetime
 from importlib.metadata import version
 import argparse
+import csv
+import hashlib
 import json
+import os
 import tempfile
 
 import numpy as np
@@ -12,6 +15,8 @@ import torchvision
 from PIL import Image
 from tqdm import tqdm
 from cleanfid import fid
+from matplotlib.figure import Figure
+from matplotlib.ticker import EngFormatter, ScalarFormatter
 
 from src.utils.download_cifar import get_cifar10
 from src.utils.sampling import integrate
@@ -25,6 +30,30 @@ FID_DATASET_RES = 32
 FID_DATASET_SPLIT = "train"
 FID_MODE = "clean"
 FID_REFERENCE_NUM_IMAGES = 50_000
+FID_REFERENCE_DESCRIPTION = (f"{FID_DATASET_NAME} {FID_DATASET_SPLIT} ({FID_REFERENCE_NUM_IMAGES} images), "
+                             f"{FID_DATASET_RES}px, {FID_MODE}: "
+                             f"{FID_DATASET_NAME}_{FID_MODE}_{FID_DATASET_SPLIT}_{FID_DATASET_RES}.npz")
+
+# One row per snapshot in the snapshot series results
+SERIES_COLUMNS = [
+    "step", "train_samples_seen", "epoch", "fid", "backbone", "snapshot", "snapshot_sha256",
+    "num_samples", "samples_per_class", "n_steps", "guidance_w", "nfe", "seed", "solver", "precision",
+    "fid_library", "fid_library_version", "fid_reference", "generation_device", "fid_device",
+    "torch_version", "timestamp",
+]
+# A snapshot is skipped when a row already holds these same values. The hash catches snapshots
+# overwritten by a resumed training, which keep their file name but hold different weights.
+SERIES_CACHE_KEYS = [
+    "snapshot", "snapshot_sha256", "num_samples", "n_steps", "guidance_w", "seed",
+    "fid_library_version", "fid_reference",
+]
+# FIDs computed with different values of any of these are not comparable
+SERIES_COMPARABLE_KEYS = ["num_samples", "n_steps", "guidance_w", "nfe", "fid_library", "fid_library_version", "fid_reference"]
+
+# Categorical slots in fixed order; each backbone keeps its color across plots
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
+BACKBONE_COLORS = {"dit": SERIES_COLORS[0], "unet": SERIES_COLORS[1]}
+BACKBONE_NAMES = {"dit": "DiT", "unet": "UNet"}
 
 def to_uint8_images(x: torch.Tensor) -> np.ndarray:
     """Map a (B, 3, H, W) batch in [-1, 1] to (B, H, W, 3) uint8 RGB in [0, 255].
@@ -163,7 +192,7 @@ def evaluate(args: argparse.Namespace) -> None:
 
     real_vs_real = args.real_vs_real
     if not real_vs_real and args.checkpoint is None and not args.untrained:
-        raise ValueError("Pass --checkpoint, --untrained or --real-vs-real")
+        raise ValueError("Pass --checkpoint, --untrained, --real-vs-real, --snapshot-dir or --plot")
     num_samples = args.num_samples if args.num_samples is not None else (10_000 if real_vs_real else 50_000)
 
     _, val_set = get_cifar10(config["data_dir"])
@@ -269,6 +298,192 @@ def evaluate(args: argparse.Namespace) -> None:
         print(f"  {key}: {value}")
     print(f"Results saved to {json_path}")
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def read_series(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as csv_file:
+        return list(csv.DictReader(csv_file))
+
+def write_series(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=SERIES_COLUMNS)
+        writer.writeheader()
+        writer.writerows(sorted(rows, key=lambda row: int(row["step"])))
+    # Atomic swap: an interrupted evaluation keeps every row written so far
+    os.replace(temporary_path, path)
+
+def evaluate_snapshot_series(args: argparse.Namespace) -> None:
+    """FID of every snapshot in a directory, with the same N, n_steps, w and seed for all of them.
+
+    generate_samples() rebuilds its generator from the seed for each snapshot, so every snapshot
+    starts from the same noise and labels: the differences along the curve come from the model only.
+    """
+    config = load_training_config(args.config)
+    snapshot_paths = sorted(args.snapshot_dir.glob("step_*.pt"))
+    if not snapshot_paths:
+        raise ValueError(f"No step_*.pt snapshot in {args.snapshot_dir}")
+    num_samples = args.num_samples if args.num_samples is not None else 50_000
+
+    _, val_set = get_cifar10(config["data_dir"])
+    num_classes = len(val_set.classes)
+    image_shape = tuple(val_set[0][0].shape)
+    if num_samples <= 0 or num_samples % num_classes != 0:
+        raise ValueError(f"--num-samples must be a positive multiple of {num_classes}, got {num_samples}")
+
+    device = validate_device(args.device if args.device is not None else config["device"])
+    fid_device = validate_device(args.fid_device) if args.fid_device is not None else device
+
+    series_name = f"snapshots_{args.snapshot_dir.name}_n{num_samples}_steps{args.n_steps}_w{args.guidance:g}_seed{args.seed}"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    results_path = args.output_dir / f"{series_name}.csv"
+    grid_dir = args.output_dir / f"{series_name}_grids"
+    grid_dir.mkdir(exist_ok=True)
+
+    evaluation = {
+        "num_samples": num_samples,
+        "samples_per_class": num_samples // num_classes,
+        "n_steps": args.n_steps,
+        "guidance_w": args.guidance,
+        "nfe": args.n_steps * (1 if args.guidance == 0 else 2),
+        "seed": args.seed,
+        "solver": "euler",
+        "precision": "float32",
+        "fid_library": "clean-fid",
+        "fid_library_version": version("clean-fid"),
+        "fid_reference": FID_REFERENCE_DESCRIPTION,
+        "generation_device": str(device),
+        "fid_device": str(fid_device),
+        "torch_version": torch.__version__,
+    }
+
+    rows = {row["snapshot"]: row for row in read_series(results_path)} if results_path.exists() else {}
+    # Rows of snapshots that are gone (e.g. removed by a resumed training as a discarded branch) leave the series
+    existing = {path.name for path in snapshot_paths}
+    for name in sorted(set(rows) - existing):
+        print(f"Dropping the row of {name}: the snapshot is no longer in {args.snapshot_dir}")
+        del rows[name]
+
+    for snapshot_path in snapshot_paths:
+        key = {**evaluation, "snapshot": snapshot_path.name, "snapshot_sha256": file_sha256(snapshot_path)}
+        cached = rows.get(snapshot_path.name)
+        if cached is not None and all(cached[k] == str(key[k]) for k in SERIES_CACHE_KEYS):
+            print(f"Skipping {snapshot_path.name}: already evaluated (FID {float(cached['fid']):.2f})")
+            continue
+
+        snapshot = torch.load(snapshot_path, map_location="cpu", weights_only=True)
+        if snapshot["num_classes"] != num_classes:
+            raise ValueError(f"{snapshot_path} has {snapshot['num_classes']} classes, the dataset {num_classes}")
+        torch.manual_seed(args.seed)
+        flow_matching_model = FlowMatchingModel(
+            backbone=snapshot["backbone"],
+            backbone_config_file=Path(snapshot["backbone_config"]),
+            embedding_dim=snapshot["embedding_dim"],
+            num_classes=snapshot["num_classes"],
+            device=device
+        )
+        load_ema_weights(flow_matching_model, snapshot_path, device)
+        flow_matching_model.eval()
+
+        grid_images: dict[int, list[np.ndarray]] = {c: [] for c in range(num_classes)}
+        with tempfile.TemporaryDirectory(prefix="fid_samples_") as temporary_dir:
+            generate_samples(
+                flow_matching_model, num_samples, num_classes, image_shape, args.n_steps, args.guidance,
+                args.batch_size, args.seed, device, Path(temporary_dir), grid_images, args.grid_per_class,
+            )
+            fid_value = compute_fid(Path(temporary_dir), num_samples, fid_device, args.fid_batch_size, args.num_workers)
+        save_grid(grid_images, grid_dir / f"{snapshot_path.stem}_grid.png")
+
+        rows[snapshot_path.name] = {
+            **key,
+            "step": snapshot["optimizer_steps"],
+            "train_samples_seen": snapshot["train_samples_seen"],
+            "epoch": snapshot["epochs"],
+            "fid": fid_value,
+            "backbone": snapshot["backbone"],
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        write_series(results_path, list(rows.values()))
+        print(f"{snapshot_path.name}: FID {fid_value:.2f}")
+
+    write_series(results_path, list(rows.values()))
+    print(f"\n\033[1mFID series\033[0m ({results_path})")
+    for row in sorted(rows.values(), key=lambda row: int(row["step"])):
+        print(f"  step {int(row['step']):>7}  samples seen {int(row['train_samples_seen']):>9}  FID {float(row['fid']):.2f}")
+
+def plot_series(result_paths: list[Path], output_path: Path) -> None:
+    """FID against train samples seen for one or more series results, on the same axes."""
+    series = [(path, read_series(path)) for path in result_paths]
+    for path, rows in series:
+        if not rows:
+            raise ValueError(f"{path} holds no rows")
+
+    # Checked across every row, so a file mixing parameters is refused as well
+    for key in SERIES_COMPARABLE_KEYS:
+        files_by_value: dict[str, set[str]] = {}
+        for path, rows in series:
+            for row in rows:
+                files_by_value.setdefault(row[key], set()).add(str(path))
+        if len(files_by_value) > 1:
+            details = "; ".join(f"{key}={value} in {', '.join(sorted(files))}" for value, files in files_by_value.items())
+            raise ValueError(f"FIDs evaluated with a different '{key}' are not comparable: {details}")
+    seeds = {row["seed"] for _, rows in series for row in rows}
+    if len(seeds) > 1:
+        print(f"Note: the series use different seeds {sorted(seeds)}: comparable, but not on the same noise")
+
+    text_primary, text_secondary, surface, grid_color = "#0b0b0b", "#52514e", "#fcfcfb", "#e4e3de"
+    figure = Figure(figsize=(8, 5), dpi=150, facecolor=surface)
+    axes = figure.subplots()
+    axes.set_facecolor(surface)
+
+    backbones = [rows[0]["backbone"] for _, rows in series]
+    spare_colors = iter(color for color in SERIES_COLORS if color not in BACKBONE_COLORS.values())
+    for (path, rows), backbone in zip(series, backbones):
+        rows = sorted(rows, key=lambda row: int(row["train_samples_seen"]))
+        x = [int(row["train_samples_seen"]) for row in rows]
+        y = [float(row["fid"]) for row in rows]
+        color = BACKBONE_COLORS.get(backbone) or next(spare_colors)
+        label = BACKBONE_NAMES.get(backbone, backbone)
+        if backbones.count(backbone) > 1:
+            label = f"{label} ({path.stem})"
+        axes.plot(x, y, color=color, linewidth=1.5, marker="o", markersize=6,
+                  markeredgecolor=surface, markeredgewidth=1.5, label=label, zorder=3)
+        # Direct label on the last point only
+        axes.annotate(f"{label}  {y[-1]:.1f}", (x[-1], y[-1]), xytext=(8, 0), textcoords="offset points",
+                      va="center", fontsize=9, color=text_primary)
+
+    first = series[0][1][0]
+    guidance = f"w={float(first['guidance_w']):g}"
+    axes.set_title("FID against training samples seen", loc="left", fontsize=13, color=text_primary, pad=24)
+    axes.text(0, 1.02, f"N={first['num_samples']}, {first['n_steps']} Euler steps, {guidance} (NFE {first['nfe']}), "
+                       f"EMA weights · {first['fid_library']} {first['fid_library_version']}, "
+                       f"reference {FID_DATASET_NAME} {FID_DATASET_SPLIT}",
+              transform=axes.transAxes, fontsize=8.5, color=text_secondary)
+    axes.set_xlabel("Training samples seen", color=text_secondary)
+    axes.set_ylabel("FID (log scale, lower is better)", color=text_secondary)
+    axes.set_yscale("log")
+    axes.yaxis.set_major_formatter(ScalarFormatter())
+    axes.yaxis.set_minor_formatter(ScalarFormatter())
+    axes.xaxis.set_major_formatter(EngFormatter(sep=""))
+    axes.grid(True, which="both", color=grid_color, linewidth=0.6, zorder=0)
+    for side in ("top", "right"):
+        axes.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        axes.spines[side].set_color(text_secondary)
+    axes.tick_params(colors=text_secondary, which="both", labelsize=8)
+    axes.legend(frameon=False, labelcolor=text_primary, fontsize=9, loc="upper right")
+    axes.margins(x=0.12)
+    figure.tight_layout()
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, facecolor=surface)
+    print(f"Plot saved to {output_path}")
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute the FID of a Flow-Matching model against CIFAR-10 with clean-fid.")
     parser.add_argument(
@@ -294,6 +509,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sanity check: FID of real validation images against the train reference, "
              "through the same format conversion used for the samples.",
+    )
+    source.add_argument(
+        "--snapshot-dir",
+        type=Path,
+        default=None,
+        help="Directory of training snapshots (step_*.pt): FID of each one with the same N, n_steps, w and seed, "
+             "saved to one CSV row per snapshot. Snapshots already evaluated with the same parameters are skipped.",
+    )
+    source.add_argument(
+        "--plot",
+        type=Path,
+        nargs="+",
+        default=None,
+        help="Snapshot series CSV files (e.g. one per backbone) to plot as FID against train samples seen. "
+             "Refused if they were evaluated with different N, n_steps, w or reference.",
+    )
+    parser.add_argument(
+        "--plot-output",
+        type=Path,
+        default=Path("results/fid/fid_vs_samples_seen.png"),
+        help="Where --plot saves the figure.",
     )
     parser.add_argument(
         "--backbone",
@@ -384,4 +620,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 if __name__ == "__main__":
-    evaluate(parse_args())
+    args = parse_args()
+    if args.plot is not None:
+        plot_series(args.plot, args.plot_output)
+    elif args.snapshot_dir is not None:
+        evaluate_snapshot_series(args)
+    else:
+        evaluate(args)

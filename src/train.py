@@ -74,6 +74,14 @@ def train(config: dict[str, Any]):
         wandb_run_id = checkpoint.get("wandb_run_id")
         next_log_iteration = (optimizer_steps // config["log_every_iterations"] + 1) * config["log_every_iterations"]
 
+    if config["resume_from"] is not None and config["snapshot_every_iterations"] is not None:
+        # Snapshots past the resumed step belong to a discarded training branch: the ones on the cadence
+        # would be overwritten anyway, but an off-cadence final one would otherwise stay in the series
+        for snapshot_path in sorted(get_snapshot_dir(config).glob("step_*.pt")):
+            if int(snapshot_path.stem.removeprefix("step_")) > optimizer_steps:
+                print(f"Removing {snapshot_path}: it belongs to a discarded training branch")
+                snapshot_path.unlink()
+
     initial_train_samples_seen = train_samples_seen
     training_loss = 0
     train_sample_loss = 0
@@ -209,6 +217,10 @@ def train(config: dict[str, Any]):
                 )
                 progress.update(samples_in_optimizer_step)
                 progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
+
+                # Saved after this step's EMA update, so it holds the EMA weights at optimizer_steps
+                if config["snapshot_every_iterations"] is not None and optimizer_steps % config["snapshot_every_iterations"] == 0:
+                    save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen, current_epoch)
 
                 if optimizer_steps >= next_log_iteration and train_samples_seen > skip_logging_until:
                     if config["wandb_enabled"] and wandb_current_run is not None:
@@ -348,6 +360,12 @@ def train(config: dict[str, Any]):
             break
 
     progress.close()
+
+    # Final snapshot, so the snapshot series always ends at the last step executed by this run
+    if (config["snapshot_every_iterations"] is not None
+            and train_samples_seen > initial_train_samples_seen
+            and optimizer_steps % config["snapshot_every_iterations"] != 0):
+        save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen, current_epoch)
 
     if config["wandb_enabled"] and wandb_current_run is not None and train_samples_seen > 0 and train_samples_seen > skip_logging_until:
         wandb_current_run.log(
@@ -501,6 +519,35 @@ def save_checkpoint(
     # Atomic swap, so an interruption cannot leave a corrupted checkpoint in place
     os.replace(temporary_path, path)
 
+def get_snapshot_dir(config: dict[str, Any]) -> Path:
+    return config["checkpoint_dir"] / "snapshots" / config["backbone"]
+
+def save_snapshot(
+    config: dict[str, Any],
+    ema_weights: dict[str, torch.Tensor],
+    num_classes: int,
+    optimizer_steps: int,
+    train_samples_seen: int,
+    epochs: int,
+) -> None:
+    path = get_snapshot_dir(config) / f"step_{optimizer_steps:07d}.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(
+        {
+            "ema_model_state_dict": ema_weights,
+            "optimizer_steps": optimizer_steps,
+            "train_samples_seen": train_samples_seen,
+            "epochs": epochs,
+            "backbone": config["backbone"],
+            "backbone_config": str(config["backbone_config"]),
+            "embedding_dim": config["embedding_dim"],
+            "num_classes": num_classes,
+        },
+        temporary_path,
+    )
+    os.replace(temporary_path, path)
+
 def get_learning_rate(
     config: dict[str, Any],
     iteration: int,
@@ -624,6 +671,11 @@ def load_training_config(config_path: Path) -> dict[str, Any]:
     v = training_config.get("resume_from", None)
     config["resume_from"] = Path(v) if v is not None else None
 
+    v = training_config.get("snapshot_every_iterations", None)
+    config["snapshot_every_iterations"] = None if v is None else int(v)
+    if config["snapshot_every_iterations"] is not None and config["snapshot_every_iterations"] <= 0:
+        raise ValueError("'snapshot_every_iterations' must be positive or null")
+
     if (v := wandb_config.get("enabled", None)) is None:
         raise ValueError("Missing 'enabled' in wandb config")
     config["wandb_enabled"] = bool(v)
@@ -671,6 +723,7 @@ def training_config_to_dict(config: dict[str, Any]) -> dict[str, Any]:
         "n_epochs": config["n_epochs"],
         "checkpoint_dir": str(config["checkpoint_dir"]),
         "resume_from": str(config["resume_from"]) if config["resume_from"] is not None else None,
+        "snapshot_every_iterations": config["snapshot_every_iterations"],
         "wandb": {
             "enabled": config["wandb_enabled"],
             "project": config["wandb_project"],
