@@ -1,13 +1,10 @@
 numpy
 torch>=2.10.0
-pandas
 tqdm
 PyYAML
 matplotlib
-xformers
 wandb
 huggingface_hub
-opencv-python
 torchvision
 
 clean-fid==0.1.35
