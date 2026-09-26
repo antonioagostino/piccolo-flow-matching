@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
+import yaml
 
 import numpy as np
 import torch
@@ -388,13 +389,23 @@ def evaluate_snapshot_series(args: argparse.Namespace) -> None:
         if snapshot["num_classes"] != num_classes:
             raise ValueError(f"{snapshot_path} has {snapshot['num_classes']} classes, the dataset {num_classes}")
         torch.manual_seed(args.seed)
-        flow_matching_model = FlowMatchingModel(
-            backbone=snapshot["backbone"],
-            backbone_config_file=Path(snapshot["backbone_config"]),
-            embedding_dim=snapshot["embedding_dim"],
-            num_classes=snapshot["num_classes"],
-            device=device
-        )
+        with tempfile.TemporaryDirectory(prefix="backbone_config_") as config_dir:
+            if "backbone_config_content" in snapshot:
+                # Self-contained snapshot: rebuilt from the config it was trained with, whatever the file holds now.
+                # FlowMatchingModel reads its config from a file, so the content goes through a temporary one.
+                backbone_config_file = Path(config_dir) / "backbone.yaml"
+                with backbone_config_file.open("w", encoding="utf-8") as config_file:
+                    yaml.safe_dump(snapshot["backbone_config_content"], config_file)
+            else:
+                # Older snapshots only record the path of the config
+                backbone_config_file = Path(snapshot["backbone_config"])
+            flow_matching_model = FlowMatchingModel(
+                backbone=snapshot["backbone"],
+                backbone_config_file=backbone_config_file,
+                embedding_dim=snapshot["embedding_dim"],
+                num_classes=snapshot["num_classes"],
+                device=device
+            )
         load_ema_weights(flow_matching_model, snapshot_path, device)
         flow_matching_model.eval()
 

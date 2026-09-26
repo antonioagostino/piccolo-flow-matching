@@ -32,6 +32,10 @@ def train(config: dict[str, Any]):
 
     val_generator = torch.Generator()
 
+    # Read once, next to the model it builds: snapshots store it, so they do not depend on the file later on
+    with Path(config["backbone_config"]).open("r", encoding="utf-8") as backbone_config_file:
+        backbone_config_content = yaml.safe_load(backbone_config_file)
+
     flow_matching_model = FlowMatchingModel(
         backbone=config["backbone"],
         backbone_config_file=config["backbone_config"],
@@ -111,6 +115,8 @@ def train(config: dict[str, Any]):
     train_sample_loss = 0
     ema_loss = None
     ema_alpha = 0.98
+    # Per-step losses kept on the device, read back only where a value is needed (see flush_step_losses)
+    pending_step_losses: list[tuple[list[torch.Tensor], int]] = []
 
     if wandb_run_id is None:
         wandb_run_id = config["wandb_resume_id"]
@@ -182,7 +188,7 @@ def train(config: dict[str, Any]):
                 break
 
             optimizer.zero_grad()
-            accumulated_loss = 0.0
+            micro_step_losses: list[torch.Tensor] = []
             samples_in_optimizer_step = 0
             epoch_ended = False
 
@@ -224,7 +230,7 @@ def train(config: dict[str, Any]):
                     loss = mse_loss(v_theta, target)
 
                 scaler.scale(loss / config["gradient_accumulation_steps"]).backward()
-                accumulated_loss += float(loss.detach().item())
+                micro_step_losses.append(loss.detach())
                 samples_in_optimizer_step += x.shape[0]
 
             if samples_in_optimizer_step:
@@ -244,16 +250,9 @@ def train(config: dict[str, Any]):
                         if param.requires_grad:
                             ema_weights[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
 
-                training_loss = accumulated_loss / config["gradient_accumulation_steps"]
+                pending_step_losses.append((micro_step_losses, samples_in_optimizer_step))
                 train_samples_seen += samples_in_optimizer_step
-                train_sample_loss += training_loss * samples_in_optimizer_step
-                avg_train_loss = train_sample_loss / (train_samples_seen - initial_train_samples_seen)
-                ema_loss = (
-                    training_loss if ema_loss is None
-                    else ema_alpha * ema_loss + (1 - ema_alpha) * training_loss
-                )
                 progress.update(samples_in_optimizer_step)
-                progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
 
                 # The clock starts after the first optimizer step of this run, where torch.compile compiles
                 # the model; every later pause is closed within the same step, so it is running from then on
@@ -264,10 +263,16 @@ def train(config: dict[str, Any]):
                 if config["snapshot_every_iterations"] is not None and optimizer_steps % config["snapshot_every_iterations"] == 0:
                     training_clock.pause()
                     save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen,
-                                  current_epoch, training_clock.elapsed_seconds, forward_gflops)
+                                  current_epoch, training_clock.elapsed_seconds, forward_gflops, backbone_config_content)
                     training_clock.start()
 
                 if optimizer_steps >= next_log_iteration and train_samples_seen > skip_logging_until:
+                    training_loss, train_sample_loss, ema_loss = flush_step_losses(
+                        pending_step_losses, config["gradient_accumulation_steps"],
+                        training_loss, train_sample_loss, ema_loss, ema_alpha,
+                    )
+                    avg_train_loss = train_sample_loss / (train_samples_seen - initial_train_samples_seen)
+                    progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
                     if config["wandb_enabled"] and wandb_current_run is not None:
                         wandb_current_run.log(
                             data={
@@ -286,6 +291,11 @@ def train(config: dict[str, Any]):
                 if optimizer_steps % config["val_every_iterations"] == 0:
                     # Validation and checkpoint saving are excluded from the training time
                     training_clock.pause()
+                    # The checkpoints below store the current training loss
+                    training_loss, train_sample_loss, ema_loss = flush_step_losses(
+                        pending_step_losses, config["gradient_accumulation_steps"],
+                        training_loss, train_sample_loss, ema_loss, ema_alpha,
+                    )
                     print("\nStarting validation...")
                     validation_loss = 0
                     dataset_cursor["val"] = 0
@@ -411,13 +421,17 @@ def train(config: dict[str, Any]):
 
     progress.close()
     training_clock.pause()
+    training_loss, train_sample_loss, ema_loss = flush_step_losses(
+        pending_step_losses, config["gradient_accumulation_steps"],
+        training_loss, train_sample_loss, ema_loss, ema_alpha,
+    )
 
     # Final snapshot, so the snapshot series always ends at the last step executed by this run
     if (config["snapshot_every_iterations"] is not None
             and train_samples_seen > initial_train_samples_seen
             and optimizer_steps % config["snapshot_every_iterations"] != 0):
         save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen,
-                      current_epoch, training_clock.elapsed_seconds, forward_gflops)
+                      current_epoch, training_clock.elapsed_seconds, forward_gflops, backbone_config_content)
 
     if config["wandb_enabled"] and wandb_current_run is not None and train_samples_seen > 0 and train_samples_seen > skip_logging_until:
         wandb_current_run.log(
@@ -586,6 +600,33 @@ def count_forward_gflops(backbone: str,
         model(x, t, y)
     return flop_counter.get_total_flops() / 1e9
 
+def flush_step_losses(pending_step_losses: list[tuple[list[torch.Tensor], int]],
+                      gradient_accumulation_steps: int,
+                      training_loss: float,
+                      train_sample_loss: float,
+                      ema_loss: float | None,
+                      ema_alpha: float) -> tuple[float, float, float | None]:
+    """Read back the pending per-step losses with a single device sync and update the running statistics.
+
+    The values are replayed in Python floats in the same order as a per-micro-step .item() would, so
+    training_loss, the per-sample average and the EMA are identical to reading each loss right away.
+    """
+    if not pending_step_losses:
+        return training_loss, train_sample_loss, ema_loss
+    values = iter(torch.stack([loss for losses, _ in pending_step_losses for loss in losses]).tolist())
+    for losses, samples_in_optimizer_step in pending_step_losses:
+        accumulated_loss = 0.0
+        for _ in losses:
+            accumulated_loss += next(values)
+        training_loss = accumulated_loss / gradient_accumulation_steps
+        train_sample_loss += training_loss * samples_in_optimizer_step
+        ema_loss = (
+            training_loss if ema_loss is None
+            else ema_alpha * ema_loss + (1 - ema_alpha) * training_loss
+        )
+    pending_step_losses.clear()
+    return training_loss, train_sample_loss, ema_loss
+
 def get_train_batch_on_device(images: torch.Tensor,
                               labels: torch.Tensor,
                               batch_indices: torch.Tensor,
@@ -649,6 +690,7 @@ def save_snapshot(
     epochs: int,
     training_time_seconds: float,
     forward_gflops_per_sample: float,
+    backbone_config_content: dict[str, Any],
 ) -> None:
     path = get_snapshot_dir(config) / f"step_{optimizer_steps:07d}.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -661,6 +703,7 @@ def save_snapshot(
             "epochs": epochs,
             "backbone": config["backbone"],
             "backbone_config": str(config["backbone_config"]),
+            "backbone_config_content": backbone_config_content,
             "embedding_dim": config["embedding_dim"],
             "num_classes": num_classes,
             "training_time_seconds": training_time_seconds,
