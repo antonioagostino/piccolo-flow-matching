@@ -7,8 +7,8 @@ training:
   data_on_device: true
   batch_size: 256
   gradient_accumulation_steps: 1
-  learning_rate: FILL_ME
-  min_learning_rate: FILL_ME
+  learning_rate: 1.0e-3
+  min_learning_rate: 1.0e-5
   lr_warmup_iterations: 1000
   max_iterations: 734480
   weight_decay: 0.0
