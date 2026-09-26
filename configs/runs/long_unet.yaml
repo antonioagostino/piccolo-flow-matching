@@ -4,13 +4,13 @@ training:
   backbone_config: ./configs/unet.yaml
   embedding_dim: 384
   sigma_min: 0.0
-  data_on_device: false
-  batch_size: 128
+  data_on_device: true
+  batch_size: 256
   gradient_accumulation_steps: 1
   learning_rate: FILL_ME
   min_learning_rate: FILL_ME
   lr_warmup_iterations: 1000
-  max_iterations: FILL_ME
+  max_iterations: 734480
   weight_decay: 0.0
   max_grad_norm: 1.0
   ema_decay: 0.9999
@@ -18,9 +18,9 @@ training:
   compile_model: true
   seed: 42
   log_every_iterations: 100
-  val_every_iterations: FILL_ME
+  val_every_iterations: 36724
   val_max_iterations: 40
-  snapshot_every_iterations: FILL_ME
+  snapshot_every_iterations: 36724
   n_epochs: 100000
   checkpoint_dir: ./checkpoints/long_unet
   resume_from: null

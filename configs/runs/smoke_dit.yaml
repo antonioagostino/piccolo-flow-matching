@@ -4,8 +4,8 @@ training:
   backbone_config: ./configs/dit.yaml
   embedding_dim: 384
   sigma_min: 0.0
-  data_on_device: false
-  batch_size: 128
+  data_on_device: true
+  batch_size: 256
   gradient_accumulation_steps: 1
   learning_rate: 3.0e-4
   min_learning_rate: 3.0e-4
