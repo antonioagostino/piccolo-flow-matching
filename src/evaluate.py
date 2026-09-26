@@ -24,6 +24,9 @@ from src.utils.sampling import integrate
 from src.flow import FlowMatchingModel
 from src.train import load_training_config, validate_device
 
+
+torch.set_float32_matmul_precision("high")
+
 # Reference: clean-fid's precomputed Inception statistics of the full CIFAR-10 train split
 # (50,000 images), stored as cifar10_clean_train_32.npz.
 FID_DATASET_NAME = "cifar10"
