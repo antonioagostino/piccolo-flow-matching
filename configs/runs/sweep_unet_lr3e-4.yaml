@@ -1,0 +1,32 @@
+training:
+  data_dir: ./data/
+  backbone: unet
+  backbone_config: ./configs/unet.yaml
+  embedding_dim: 384
+  sigma_min: 0.0
+  data_on_device: false
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-4
+  min_learning_rate: 3.0e-4
+  lr_warmup_iterations: 1000
+  max_iterations: FILL_ME
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  ema_decay: 0.9999
+  device: cuda
+  compile_model: true
+  seed: 42
+  log_every_iterations: 100
+  val_every_iterations: FILL_ME
+  val_max_iterations: 40
+  snapshot_every_iterations: FILL_ME
+  n_epochs: 100000
+  checkpoint_dir: ./checkpoints/sweep_unet_lr3e-4
+  resume_from: null
+  wandb:
+    enabled: true
+    project: piccolo-flow-matching
+    run_name: sweep_unet_lr3e-4
+    mode: online
+    resume_id: null
