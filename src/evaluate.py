@@ -39,7 +39,7 @@ SERIES_COLUMNS = [
     "step", "train_samples_seen", "epoch", "fid", "backbone", "snapshot", "snapshot_sha256",
     "num_samples", "samples_per_class", "n_steps", "guidance_w", "nfe", "seed", "solver", "precision",
     "fid_library", "fid_library_version", "fid_reference", "generation_device", "fid_device",
-    "torch_version", "timestamp",
+    "torch_version", "timestamp", "training_time_seconds", "forward_gflops_per_sample",
 ]
 # A snapshot is skipped when a row already holds these same values. The hash catches snapshots
 # overwritten by a resumed training, which keep their file name but hold different weights.
@@ -54,6 +54,14 @@ SERIES_COMPARABLE_KEYS = ["num_samples", "n_steps", "guidance_w", "nfe", "fid_li
 SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 BACKBONE_COLORS = {"dit": SERIES_COLORS[0], "unet": SERIES_COLORS[1]}
 BACKBONE_NAMES = {"dit": "DiT", "unet": "UNet"}
+
+# x axes of the FID plot: (column it needs besides train_samples_seen, title, axis label)
+PLOT_X_AXES = {
+    "samples": (None, "FID against training samples seen", "Training samples seen"),
+    "flops": ("forward_gflops_per_sample", "FID against training compute",
+              "Training FLOPs (samples seen × 3 × forward FLOPs per sample)"),
+    "time": ("training_time_seconds", "FID against training time", "Training time (hours)"),
+}
 
 def to_uint8_images(x: torch.Tensor) -> np.ndarray:
     """Map a (B, 3, H, W) batch in [-1, 1] to (B, H, W, 3) uint8 RGB in [0, 255].
@@ -407,6 +415,9 @@ def evaluate_snapshot_series(args: argparse.Namespace) -> None:
             "fid": fid_value,
             "backbone": snapshot["backbone"],
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            # Empty for snapshots saved before train.py recorded them: --plot refuses those x axes
+            "training_time_seconds": snapshot.get("training_time_seconds", ""),
+            "forward_gflops_per_sample": snapshot.get("forward_gflops_per_sample", ""),
         }
         write_series(results_path, list(rows.values()))
         print(f"{snapshot_path.name}: FID {fid_value:.2f}")
@@ -416,12 +427,22 @@ def evaluate_snapshot_series(args: argparse.Namespace) -> None:
     for row in sorted(rows.values(), key=lambda row: int(row["step"])):
         print(f"  step {int(row['step']):>7}  samples seen {int(row['train_samples_seen']):>9}  FID {float(row['fid']):.2f}")
 
-def plot_series(result_paths: list[Path], output_path: Path) -> None:
-    """FID against train samples seen for one or more series results, on the same axes."""
+def plot_series(result_paths: list[Path], output_path: Path, x_axis: str = "samples") -> None:
+    """FID against train samples seen, training FLOPs or training time for one or more series results, on the same axes."""
     series = [(path, read_series(path)) for path in result_paths]
     for path, rows in series:
         if not rows:
             raise ValueError(f"{path} holds no rows")
+
+    required_column, title, x_label = PLOT_X_AXES[x_axis]
+    if required_column is not None:
+        for path, rows in series:
+            missing = [row["step"] for row in rows if not row.get(required_column)]
+            if missing:
+                raise ValueError(
+                    f"--x-axis {x_axis} needs '{required_column}', missing in {path} for steps {', '.join(missing)}: "
+                    "those snapshots were saved before train.py recorded it"
+                )
 
     # Checked across every row, so a file mixing parameters is refused as well
     for key in SERIES_COMPARABLE_KEYS:
@@ -445,7 +466,13 @@ def plot_series(result_paths: list[Path], output_path: Path) -> None:
     spare_colors = iter(color for color in SERIES_COLORS if color not in BACKBONE_COLORS.values())
     for (path, rows), backbone in zip(series, backbones):
         rows = sorted(rows, key=lambda row: int(row["train_samples_seen"]))
-        x = [int(row["train_samples_seen"]) for row in rows]
+        if x_axis == "flops":
+            # Forward + backward ≈ 3 forward passes per training sample
+            x = [int(row["train_samples_seen"]) * 3 * float(row["forward_gflops_per_sample"]) * 1e9 for row in rows]
+        elif x_axis == "time":
+            x = [float(row["training_time_seconds"]) / 3600 for row in rows]
+        else:
+            x = [int(row["train_samples_seen"]) for row in rows]
         y = [float(row["fid"]) for row in rows]
         color = BACKBONE_COLORS.get(backbone) or next(spare_colors)
         label = BACKBONE_NAMES.get(backbone, backbone)
@@ -459,17 +486,20 @@ def plot_series(result_paths: list[Path], output_path: Path) -> None:
 
     first = series[0][1][0]
     guidance = f"w={float(first['guidance_w']):g}"
-    axes.set_title("FID against training samples seen", loc="left", fontsize=13, color=text_primary, pad=24)
+    axes.set_title(title, loc="left", fontsize=13, color=text_primary, pad=24)
     axes.text(0, 1.02, f"N={first['num_samples']}, {first['n_steps']} Euler steps, {guidance} (NFE {first['nfe']}), "
                        f"EMA weights · {first['fid_library']} {first['fid_library_version']}, "
                        f"reference {FID_DATASET_NAME} {FID_DATASET_SPLIT}",
               transform=axes.transAxes, fontsize=8.5, color=text_secondary)
-    axes.set_xlabel("Training samples seen", color=text_secondary)
+    axes.set_xlabel(x_label, color=text_secondary)
     axes.set_ylabel("FID (log scale, lower is better)", color=text_secondary)
     axes.set_yscale("log")
     axes.yaxis.set_major_formatter(ScalarFormatter())
     axes.yaxis.set_minor_formatter(ScalarFormatter())
-    axes.xaxis.set_major_formatter(EngFormatter(sep=""))
+    if x_axis == "flops":
+        axes.xaxis.set_major_formatter(EngFormatter(unit="FLOP"))
+    elif x_axis == "samples":
+        axes.xaxis.set_major_formatter(EngFormatter(sep=""))
     axes.grid(True, which="both", color=grid_color, linewidth=0.6, zorder=0)
     for side in ("top", "right"):
         axes.spines[side].set_visible(False)
@@ -528,8 +558,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-output",
         type=Path,
-        default=Path("results/fid/fid_vs_samples_seen.png"),
-        help="Where --plot saves the figure.",
+        default=None,
+        help="Where --plot saves the figure (default: results/fid/fid_vs_{x axis}.png).",
+    )
+    parser.add_argument(
+        "--x-axis",
+        choices=list(PLOT_X_AXES),
+        default="samples",
+        help="x axis of --plot: train samples seen, training FLOPs (samples seen × 3 × forward GFLOPs × 1e9) "
+             "or training time in hours. The last two need snapshots that record forward GFLOPs and training time.",
     )
     parser.add_argument(
         "--backbone",
@@ -622,7 +659,8 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     if args.plot is not None:
-        plot_series(args.plot, args.plot_output)
+        plot_output = args.plot_output if args.plot_output is not None else Path(f"results/fid/fid_vs_{args.x_axis}.png")
+        plot_series(args.plot, plot_output, args.x_axis)
     elif args.snapshot_dir is not None:
         evaluate_snapshot_series(args)
     else:

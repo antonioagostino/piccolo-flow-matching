@@ -4,11 +4,14 @@ import random
 import math
 import copy
 import os
+import time
 from pathlib import Path
 import yaml
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.flop_counter import FlopCounterMode
 from tqdm import tqdm
 import wandb
 
@@ -37,6 +40,22 @@ def train(config: dict[str, Any]):
         device=device
     )
 
+    # Counted once, on an uncompiled copy. The image shape comes from the raw data: indexing
+    # train_set would draw a random flip and shift the training RNG stream.
+    forward_gflops = count_forward_gflops(
+        config["backbone"],
+        config["backbone_config"],
+        config["embedding_dim"],
+        len(train_set.classes),
+        (train_set.data.shape[3], *train_set.data.shape[1:3]),
+    )
+    print(f"Forward GFLOPs per sample: {forward_gflops:.3f}")
+
+    if config["data_on_device"]:
+        # The whole train set as uint8 on the device (~150 MB for CIFAR-10), normalized and flipped per batch
+        train_images_on_device = torch.from_numpy(train_set.data).permute(0, 3, 1, 2).contiguous().to(device)
+        train_labels_on_device = torch.tensor(train_set.targets, dtype=torch.long, device=device)
+
     if config["compile_model"]:
         flow_matching_model = cast(FlowMatchingModel, torch.compile(flow_matching_model))
 
@@ -58,6 +77,7 @@ def train(config: dict[str, Any]):
     start_epoch = 1
     next_log_iteration = config["log_every_iterations"]
     train_samples_seen = 0
+    training_time_seconds = 0.0
     best_val_loss = float("inf")
     wandb_run_id: str | None = None
 
@@ -69,6 +89,10 @@ def train(config: dict[str, Any]):
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         optimizer_steps = checkpoint["optimizer_steps"]
         train_samples_seen = checkpoint["train_samples_seen"]
+        if "training_time_seconds" in checkpoint:
+            training_time_seconds = checkpoint["training_time_seconds"]
+        else:
+            print("Warning: the checkpoint has no training time, the time axis restarts from zero")
         best_val_loss = checkpoint["best_val_loss"]
         start_epoch = checkpoint["epochs"]
         wandb_run_id = checkpoint.get("wandb_run_id")
@@ -101,7 +125,7 @@ def train(config: dict[str, Any]):
             resume="must" if wandb_run_id is not None else None,
             config={
                 "training": training_config_to_dict(config),
-                "model": model_config_to_dict(flow_matching_model),
+                "model": {**model_config_to_dict(flow_matching_model), "forward_gflops_per_sample": forward_gflops},
             },
         )
 
@@ -144,11 +168,15 @@ def train(config: dict[str, Any]):
     if start_epoch > config["n_epochs"]:
         print(f"Skipping training: resumed at epoch {start_epoch} but n_epochs is {config['n_epochs']}")
 
+    training_clock = TrainingClock(device, training_time_seconds)
+
     for current_epoch in range(start_epoch, config["n_epochs"] + 1):
         random.seed(config["seed"] + current_epoch)
         random.shuffle(dataset_samples_order["train"])
         dataset_cursor["train"] = 0
-        
+        if config["data_on_device"]:
+            train_order_on_device = torch.tensor(dataset_samples_order["train"], dtype=torch.long, device=device)
+
         while True:
             if config["max_iterations"] is not None and optimizer_steps >= config["max_iterations"]:
                 break
@@ -159,20 +187,29 @@ def train(config: dict[str, Any]):
             epoch_ended = False
 
             for _ in range(config["gradient_accumulation_steps"]):
-                x_batch = []
-                y_batch = []
-                try:
-                    for _ in range(config["batch_size"]):
-                        x, y = train_set[dataset_samples_order["train"][dataset_cursor["train"]]]
-                        x_batch.append(x)
-                        y_batch.append(y)
-                        dataset_cursor["train"] += 1
-                except IndexError:
-                    epoch_ended = True
-                    break
+                if config["data_on_device"]:
+                    # Same semantics as the loader path below: the partial last batch is dropped and ends the epoch
+                    if dataset_cursor["train"] + config["batch_size"] > len(train_set):
+                        epoch_ended = True
+                        break
+                    batch_indices = train_order_on_device[dataset_cursor["train"]:dataset_cursor["train"] + config["batch_size"]]
+                    dataset_cursor["train"] += config["batch_size"]
+                    x, y = get_train_batch_on_device(train_images_on_device, train_labels_on_device, batch_indices)
+                else:
+                    x_batch = []
+                    y_batch = []
+                    try:
+                        for _ in range(config["batch_size"]):
+                            x, y = train_set[dataset_samples_order["train"][dataset_cursor["train"]]]
+                            x_batch.append(x)
+                            y_batch.append(y)
+                            dataset_cursor["train"] += 1
+                    except IndexError:
+                        epoch_ended = True
+                        break
 
-                x = torch.stack(x_batch).to(device)
-                y = torch.tensor(y_batch, dtype=torch.long, device=device)
+                    x = torch.stack(x_batch).to(device)
+                    y = torch.tensor(y_batch, dtype=torch.long, device=device)
 
                 # TODO: implement importance sampling
                 timesteps = torch.rand((config["batch_size"],), device=device)
@@ -218,9 +255,17 @@ def train(config: dict[str, Any]):
                 progress.update(samples_in_optimizer_step)
                 progress.set_postfix(loss=f"{ema_loss:.4f}", lr=f"{learning_rate:.2e}")
 
+                # The clock starts after the first optimizer step of this run, where torch.compile compiles
+                # the model; every later pause is closed within the same step, so it is running from then on
+                if not training_clock.running:
+                    training_clock.start()
+
                 # Saved after this step's EMA update, so it holds the EMA weights at optimizer_steps
                 if config["snapshot_every_iterations"] is not None and optimizer_steps % config["snapshot_every_iterations"] == 0:
-                    save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen, current_epoch)
+                    training_clock.pause()
+                    save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen,
+                                  current_epoch, training_clock.elapsed_seconds, forward_gflops)
+                    training_clock.start()
 
                 if optimizer_steps >= next_log_iteration and train_samples_seen > skip_logging_until:
                     if config["wandb_enabled"] and wandb_current_run is not None:
@@ -239,6 +284,8 @@ def train(config: dict[str, Any]):
                         next_log_iteration += config["log_every_iterations"]
 
                 if optimizer_steps % config["val_every_iterations"] == 0:
+                    # Validation and checkpoint saving are excluded from the training time
+                    training_clock.pause()
                     print("\nStarting validation...")
                     validation_loss = 0
                     dataset_cursor["val"] = 0
@@ -316,6 +363,7 @@ def train(config: dict[str, Any]):
                             epochs=current_epoch,
                             val_loss=validation_loss,
                             best_val_loss=best_val_loss,
+                            training_time_seconds=training_clock.elapsed_seconds,
                             wandb_run_id=wandb_current_run.id if wandb_current_run is not None else None,
                         )
 
@@ -331,6 +379,7 @@ def train(config: dict[str, Any]):
                         epochs=current_epoch,
                         val_loss=validation_loss,
                         best_val_loss=best_val_loss,
+                        training_time_seconds=training_clock.elapsed_seconds,
                         wandb_run_id=wandb_current_run.id if wandb_current_run is not None else None,
                     )
 
@@ -344,6 +393,7 @@ def train(config: dict[str, Any]):
                             },
                             step=train_samples_seen,
                         )
+                    training_clock.start()
 
             if epoch_ended:
                 if config["wandb_enabled"] and wandb_current_run is not None and config["n_epochs"] > 1 and train_samples_seen > skip_logging_until:
@@ -360,12 +410,14 @@ def train(config: dict[str, Any]):
             break
 
     progress.close()
+    training_clock.pause()
 
     # Final snapshot, so the snapshot series always ends at the last step executed by this run
     if (config["snapshot_every_iterations"] is not None
             and train_samples_seen > initial_train_samples_seen
             and optimizer_steps % config["snapshot_every_iterations"] != 0):
-        save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen, current_epoch)
+        save_snapshot(config, ema_weights, base_model.num_classes, optimizer_steps, train_samples_seen,
+                      current_epoch, training_clock.elapsed_seconds, forward_gflops)
 
     if config["wandb_enabled"] and wandb_current_run is not None and train_samples_seen > 0 and train_samples_seen > skip_logging_until:
         wandb_current_run.log(
@@ -481,6 +533,70 @@ def validate_device(desired_device: str) -> torch.device:
         
         return device
 
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+class TrainingClock:
+    """Cumulative training time in seconds, paused around the sections excluded from it.
+
+    CUDA and MPS run asynchronously: the device is synchronized at every start and pause, so queued
+    work is charged to the section that issued it. Nothing is synchronized between two boundaries.
+    """
+    def __init__(self, device: torch.device, elapsed_seconds: float = 0.0):
+        self.device = device
+        self.elapsed_seconds = elapsed_seconds
+        self.started_at: float | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.started_at is not None
+
+    def start(self) -> None:
+        synchronize_device(self.device)
+        self.started_at = time.perf_counter()
+
+    def pause(self) -> None:
+        if self.started_at is not None:
+            synchronize_device(self.device)
+            self.elapsed_seconds += time.perf_counter() - self.started_at
+            self.started_at = None
+
+def count_forward_gflops(backbone: str,
+                         backbone_config: Path,
+                         embedding_dim: int,
+                         num_classes: int,
+                         image_shape: tuple[int, ...]) -> float:
+    """Forward GFLOPs for one sample, counted on a fresh uncompiled copy of the model built on the CPU.
+
+    FlopCounterMode misses fused attention kernels: on the CPU the math SDPA backend decomposes attention
+    into matmuls, so QK^T and AV are counted, while on MPS SDPA runs a fused kernel under no_grad even
+    when the math backend is forced. FLOPs do not depend on the device, so the count is always done on
+    the CPU. The CPU RNG is forked so building the copy does not shift the training random streams.
+    """
+    with torch.random.fork_rng(devices=[]):
+        model = FlowMatchingModel(backbone, backbone_config, embedding_dim, num_classes, torch.device("cpu"))
+    model.eval()
+    x = torch.zeros((1, *image_shape))
+    t = torch.zeros((1,))
+    y = torch.zeros((1,), dtype=torch.long)
+    with torch.no_grad(), sdpa_kernel(SDPBackend.MATH), FlopCounterMode(display=False) as flop_counter:
+        model(x, t, y)
+    return flop_counter.get_total_flops() / 1e9
+
+def get_train_batch_on_device(images: torch.Tensor,
+                              labels: torch.Tensor,
+                              batch_indices: torch.Tensor,
+                              horizontal_flip_p: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batch from the uint8 train set kept on the device, normalized exactly as the loader does
+    (ToTensor: float / 255, then Normalize(0.5, 0.5)), with a per-sample horizontal flip."""
+    x = images[batch_indices].float().div(255).sub(0.5).div(0.5)
+    if horizontal_flip_p > 0:
+        flip = torch.rand(x.shape[0], device=x.device) < horizontal_flip_p
+        x = torch.where(flip[:, None, None, None], x.flip(-1), x)
+    return x, labels[batch_indices]
 
 def save_checkpoint(
     path: Path,
@@ -494,6 +610,7 @@ def save_checkpoint(
     epochs: int,
     val_loss: float,
     best_val_loss: float,
+    training_time_seconds: float,
     wandb_run_id: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -512,6 +629,7 @@ def save_checkpoint(
             "epochs": epochs,
             "val_loss": val_loss,
             "best_val_loss": best_val_loss,
+            "training_time_seconds": training_time_seconds,
             "wandb_run_id": wandb_run_id,
         },
         temporary_path,
@@ -529,6 +647,8 @@ def save_snapshot(
     optimizer_steps: int,
     train_samples_seen: int,
     epochs: int,
+    training_time_seconds: float,
+    forward_gflops_per_sample: float,
 ) -> None:
     path = get_snapshot_dir(config) / f"step_{optimizer_steps:07d}.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,6 +663,8 @@ def save_snapshot(
             "backbone_config": str(config["backbone_config"]),
             "embedding_dim": config["embedding_dim"],
             "num_classes": num_classes,
+            "training_time_seconds": training_time_seconds,
+            "forward_gflops_per_sample": forward_gflops_per_sample,
         },
         temporary_path,
     )
@@ -676,6 +798,8 @@ def load_training_config(config_path: Path) -> dict[str, Any]:
     if config["snapshot_every_iterations"] is not None and config["snapshot_every_iterations"] <= 0:
         raise ValueError("'snapshot_every_iterations' must be positive or null")
 
+    config["data_on_device"] = bool(training_config.get("data_on_device", False))
+
     if (v := wandb_config.get("enabled", None)) is None:
         raise ValueError("Missing 'enabled' in wandb config")
     config["wandb_enabled"] = bool(v)
@@ -724,6 +848,7 @@ def training_config_to_dict(config: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_dir": str(config["checkpoint_dir"]),
         "resume_from": str(config["resume_from"]) if config["resume_from"] is not None else None,
         "snapshot_every_iterations": config["snapshot_every_iterations"],
+        "data_on_device": config["data_on_device"],
         "wandb": {
             "enabled": config["wandb_enabled"],
             "project": config["wandb_project"],
