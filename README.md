@@ -52,7 +52,7 @@ Throughput measured on one A100 with batch 256, bf16 autocast, `torch.compile` a
 
 **DiT.** Essentially DiT-S/2 ([Peebles & Xie, 2022](https://arxiv.org/abs/2212.09748)): patch size 2 (256 tokens), hidden size 384, 6 heads, MLP 1536, adaLN-Zero conditioning and fixed 2D sin-cos positional embeddings. I used 13 blocks instead of 12 to bring the parameter count within 5% of the UNet.
 
-**UNet.** A plain convolutional UNet with GroupNorm, SiLU and FiLM conditioning, channels from 64 to 1024. It has **no residual blocks and no self-attention**, so it is simpler than the UNets used in DDPM and ADM. Keep this in mind when reading the results: this is a comparison between these two networks, not between UNets and transformers in general.
+**UNet.** A plain convolutional UNet with the usual concatenation skip connections between encoder and decoder, GroupNorm, SiLU and FiLM conditioning, channels from 64 to 1024. Inside each level there are **no residual blocks and no self-attention**, so it is simpler than the UNets used in DDPM and ADM. Keep this in mind when reading the results: this is a comparison between these two networks, not between UNets and transformers in general.
 
 ## Protocol
 
@@ -172,6 +172,7 @@ clean-fid 0.1.35 needs scipy < 1.18, which is pinned in `requirements.txt`.
 The whole pipeline, in order:
 
 ```bash
+bash run_smoke.sh       # sanity checks: FID on known answers, short training runs
 bash run_sweep.sh       # learning rate sweeps
 bash run_sweep_fid.sh   # FID of the sweep checkpoints
 bash run_long.sh        # the two long runs
