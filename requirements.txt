@@ -1,11 +1,11 @@
 numpy
-torch>=2.10.0
+torch==2.14.0
+torchvision==0.29.0
 tqdm
 PyYAML
 matplotlib
 wandb
 huggingface_hub
-torchvision
 
 clean-fid==0.1.35
 # clean-fid 0.1.35 calls scipy.linalg.sqrtm(disp=...), removed in scipy 1.18
